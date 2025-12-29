@@ -474,14 +474,21 @@ jobs:
             echo "No start script found; skipping runtime endpoint validation." >> "$LOG"
           fi
 
-      - name: Upload build and preview artifacts
+      - name: Upload build & logs artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: build-preview
+          name: build-logs
           path: |
-            ${{ steps.detect_build_dir.outputs.build_dir }}/
             build-output.txt
             endpoint-validation.txt
+          if-no-files-found: warn
+
+      - name: Upload build directory preview
+        if: ${{ steps.detect_build_dir.outputs.build_dir != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview-dir
+          path: ${{ steps.detect_build_dir.outputs.build_dir }}/
           if-no-files-found: warn
 
       - name: Post Build Validation as PR comment
