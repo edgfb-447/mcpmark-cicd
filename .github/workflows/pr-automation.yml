@@ -1,0 +1,529 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install dependencies
+        id: install_deps_code_quality
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run ESLint
+        id: run_eslint
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          # Use npm script if available, else fallback to npx eslint
+          if node -e "const p=require('./package.json');process.exit(!(p.scripts&&p.scripts.lint)?1:0)"; then
+            npm run lint | tee eslint-output.txt
+          else
+            npx -y eslint . | tee eslint-output.txt || true
+          fi
+
+      - name: Run Prettier check
+        id: run_prettier
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          npx -y prettier --check . | tee prettier-output.txt || true
+
+      - name: Summarize Code Quality Results
+        id: summarize_code_quality
+        run: |
+          set -euo pipefail
+          echo "ESLint Result:" > code-quality-summary.txt
+          if [ -s eslint-output.txt ]; then
+            tail -n 200 eslint-output.txt >> code-quality-summary.txt || true
+          else
+            echo "No ESLint output captured." >> code-quality-summary.txt
+          fi
+          echo "" >> code-quality-summary.txt
+          echo "Prettier Result:" >> code-quality-summary.txt
+          if [ -s prettier-output.txt ]; then
+            tail -n 200 prettier-output.txt >> code-quality-summary.txt || true
+          else
+            echo "No Prettier output captured." >> code-quality-summary.txt
+          fi
+
+      - name: Upload Code Quality Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-logs
+          path: |
+            eslint-output.txt
+            prettier-output.txt
+            code-quality-summary.txt
+          if-no-files-found: warn
+
+      - name: Post Code Quality Report as PR comment
+        id: post_code_quality_comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const summary = fs.existsSync('code-quality-summary.txt') ? fs.readFileSync('code-quality-summary.txt', 'utf8') : 'No summary available.';
+            const marker = '<!-- code-quality-report -->';
+            const body = [
+              'Code Quality Report',
+              '',
+              'ESLint',
+              'Prettier',
+              '',
+              `Build: ${process.env.GITHUB_RUN_ID}`,
+              `Branch: ${pr.head.ref} -> ${pr.base.ref}`,
+              '',
+              'Summary:',
+              '```',
+              summary,
+              '```'
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100
+            });
+            const existing = comments.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: `${marker}\n${body}`
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `${marker}\n${body}`
+              });
+            }
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install dependencies
+        id: install_deps_testing
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run tests with coverage (best-effort)
+        id: run_tests
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          # Try to run tests with coverage if jest is present, else run default tests
+          if node -e "const p=require('./package.json'); const s=p.scripts&&p.scripts.test||''; const hasJest=(p.devDependencies&&p.devDependencies.jest)||(p.dependencies&&p.dependencies.jest)||(s.includes('jest')); process.exit(hasJest?0:1)"; then
+            npm test -- --coverage | tee test-output.txt || true
+          else
+            # Default test run without coverage; still capture output
+            npm test | tee test-output.txt || true
+          fi
+
+      - name: Generate coverage summary
+        id: coverage_summary
+        run: |
+          set -euo pipefail
+          SUMMARY_FILE="coverage-summary.txt"
+          echo "Test Coverage Report" > "$SUMMARY_FILE"
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e '
+            const fs = require("fs");
+            const s = JSON.parse(fs.readFileSync("coverage/coverage-summary.json", "utf8"));
+            const t = s.total || {};
+            const lines = t.lines ? t.lines.pct : 0;
+            const statements = t.statements ? t.statements.pct : 0;
+            const functions = t.functions ? t.functions.pct : 0;
+            const branches = t.branches ? t.branches.pct : 0;
+            const out = [
+              `Lines: ${lines}%`,
+              `Statements: ${statements}%`,
+              `Functions: ${functions}%`,
+              `Branches: ${branches}%`
+            ].join("\n");
+            fs.writeFileSync("coverage-summary.txt", fs.readFileSync("coverage-summary.txt", "utf8") + "\n" + out);
+            '
+          else
+            echo "No coverage-summary.json found. Tests may have run without coverage. Consider using Jest with --coverage or NYC." >> "$SUMMARY_FILE"
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/
+            test-output.txt
+            coverage-summary.txt
+          if-no-files-found: warn
+
+      - name: Post Coverage Summary as PR comment
+        id: post_testing_coverage_comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const summary = fs.existsSync('coverage-summary.txt') ? fs.readFileSync('coverage-summary.txt', 'utf8') : 'No coverage summary available.';
+            const marker = '<!-- testing-coverage-report -->';
+            const body = [
+              'Test Coverage Report',
+              '',
+              `Build: ${process.env.GITHUB_RUN_ID}`,
+              `Branch: ${pr.head.ref} -> ${pr.base.ref}`,
+              '',
+              'Summary:',
+              '```',
+              summary,
+              '```'
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100
+            });
+            const existing = comments.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: `${marker}\n${body}`
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `${marker}\n${body}`
+              });
+            }
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install dependencies
+        id: install_deps_security
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run npm audit (JSON)
+        id: npm_audit
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          npm audit --audit-level=low --json | tee audit.json || true
+
+      - name: Run Gitleaks secret scan
+        id: gitleaks_scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        with:
+          args: '--report-format json --report-path gitleaks-results.json --redact'
+
+      - name: Summarize Security Scan
+        id: summarize_security
+        run: |
+          set -euo pipefail
+          echo "Security Scan Report" > security-summary.txt
+          echo "" >> security-summary.txt
+          if [ -f audit.json ]; then
+            node -e '
+            const fs = require("fs");
+            let out = "Dependencies\n";
+            try {
+              const a = JSON.parse(fs.readFileSync("audit.json","utf8"));
+              const v = a.vulnerabilities || {};
+              const total = Object.values(v).reduce((acc, n) => acc + (typeof n === "number" ? n : 0), 0);
+              out += `Vulnerabilities: total=${total}` + "\n";
+              for (const sev of ["critical","high","moderate","low"]){
+                if (v[sev] != null) out += `${sev}: ${v[sev]}\n`;
+              }
+            } catch(e) {
+              out += "Failed to parse npm audit output.";
+            }
+            fs.appendFileSync("security-summary.txt", out + "\n");
+            '
+          else
+            echo "Dependencies\nVulnerabilities: No audit.json found (npm audit may have been skipped or failed)." >> security-summary.txt
+          fi
+
+          echo "" >> security-summary.txt
+          if [ -f gitleaks-results.json ]; then
+            node -e '
+            const fs = require("fs");
+            let out = "Secrets Scan (Gitleaks)\n";
+            try {
+              const r = JSON.parse(fs.readFileSync("gitleaks-results.json","utf8"));
+              const findings = Array.isArray(r) ? r.length : (r.findings ? r.findings.length : 0);
+              out += `Findings: ${findings}` + "\n";
+            } catch(e) {
+              out += "Failed to parse gitleaks report.";
+            }
+            fs.appendFileSync("security-summary.txt", out + "\n");
+            '
+          else
+            echo "Secrets Scan (Gitleaks)\nNo gitleaks-results.json found." >> security-summary.txt
+          fi
+
+      - name: Upload Security Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts
+          path: |
+            audit.json
+            gitleaks-results.json
+            security-summary.txt
+          if-no-files-found: warn
+
+      - name: Post Security Scan Report as PR comment
+        id: post_security_report_comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const summary = fs.existsSync('security-summary.txt') ? fs.readFileSync('security-summary.txt', 'utf8') : 'No security summary available.';
+            const marker = '<!-- security-scan-report -->';
+            const body = [
+              'Security Scan Report',
+              '',
+              'Dependencies',
+              'Vulnerabilities',
+              '',
+              `Build: ${process.env.GITHUB_RUN_ID}`,
+              `Branch: ${pr.head.ref} -> ${pr.base.ref}`,
+              '',
+              'Summary:',
+              '```',
+              summary,
+              '```'
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100
+            });
+            const existing = comments.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: `${marker}\n${body}`
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `${marker}\n${body}`
+              });
+            }
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install dependencies
+        id: install_deps_build
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build application (best-effort)
+        id: build_app
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          if node -e "const p=require('./package.json');process.exit(!(p.scripts&&p.scripts.build)?1:0)"; then
+            npm run build | tee build-output.txt
+          else
+            echo "No build script found in package.json" | tee build-output.txt
+          fi
+
+      - name: Detect build artifacts directory
+        id: detect_build_dir
+        run: |
+          set -euo pipefail
+          DIR=""
+          for d in dist build .next .output public; do
+            if [ -d "$d" ]; then DIR="$d"; break; fi
+          done
+          echo "build_dir=$DIR" >> $GITHUB_OUTPUT
+
+      - name: Start application and validate endpoints (best-effort)
+        id: validate_endpoints
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          PORT=${PORT:-3000}
+          LOG=endpoint-validation.txt
+          echo "Build Validation" > "$LOG"
+          echo "Attempting to start application on port $PORT" >> "$LOG"
+          if node -e "const p=require('./package.json');process.exit(!(p.scripts&&p.scripts.start)?1:0)"; then
+            (PORT=$PORT npm start >/tmp/app.log 2>&1 &) || true
+            # Wait up to 30s for server
+            for i in $(seq 1 30); do
+              if nc -z 127.0.0.1 "$PORT"; then echo "Server detected on port $PORT after $i s" >> "$LOG"; break; fi
+              sleep 1
+            done
+            for path in '' 'health' 'status'; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT/$path" || true)
+              echo "GET /$path -> HTTP $code" >> "$LOG"
+            done
+            pkill -f "npm start" || true
+            pkill -f "node" || true
+            echo "Captured application logs:" >> "$LOG"
+            tail -n 200 /tmp/app.log >> "$LOG" || true
+          else
+            echo "No start script found; skipping runtime endpoint validation." >> "$LOG"
+          fi
+
+      - name: Upload build and preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview
+          path: |
+            ${{ steps.detect_build_dir.outputs.build_dir }}/
+            build-output.txt
+            endpoint-validation.txt
+          if-no-files-found: warn
+
+      - name: Post Build Validation as PR comment
+        id: post_build_validation_comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const summary = fs.existsSync('endpoint-validation.txt') ? fs.readFileSync('endpoint-validation.txt', 'utf8') : 'No validation log available.';
+            const marker = '<!-- build-validation-report -->';
+            const body = [
+              'Build Validation',
+              '',
+              `Build: ${process.env.GITHUB_RUN_ID}`,
+              `Branch: ${pr.head.ref} -> ${pr.base.ref}`,
+              '',
+              'Summary:',
+              '```',
+              summary,
+              '```'
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100
+            });
+            const existing = comments.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: `${marker}\n${body}`
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `${marker}\n${body}`
+              });
+            }
